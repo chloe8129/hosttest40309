@@ -32,7 +32,7 @@ import (
 
 const (
 	defaultWorkerVersion = "v26.10.21"
-	defaultWorkerMemMB   = 136
+	defaultWorkerMemMB   = 110
 
 	defaultLoopbackXH = "127.0.0.1:18443"
 	defaultLoopbackWS = "127.0.0.1:18444"
@@ -249,7 +249,7 @@ func streamWorkerArchiveToFile(client *http.Client, baseDir, zipURL, dgstURL str
 	tmpPath := tmpFile.Name()
 
 	hasher := sha256.New()
-	copyBuf := make([]byte, 32*1024)
+	copyBuf := make([]byte, 16*1024)
 	written, copyErr := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), respZip.Body, copyBuf)
 	closeErr := tmpFile.Close()
 	if copyErr != nil {
@@ -307,7 +307,7 @@ func extractArchiveEntry(f *zip.File, destPath string, mode os.FileMode, mutateH
 		return err
 	}
 
-	copyBuf := make([]byte, 32*1024)
+	copyBuf := make([]byte, 16*1024)
 	if _, err := io.CopyBuffer(out, rc, copyBuf); err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmpDest)
@@ -342,17 +342,16 @@ func assetLocationEnvKey() string {
 	return joinParts("XR", "AY_LOCATION_ASSET")
 }
 
+// resolveRuntimeBinDir prioritizes persistent container disk (/home/container/bin)
+// because /tmp in Pterodactyl/Bot-Hosting containers is mounted as tmpfs in RAM!
 func resolveRuntimeBinDir() string {
 	wd := resolveWorkingDir()
-	// Prioritize /tmp and /var/tmp so the 512MB persistent container disk on Bot-Hosting Free Tier is preserved
 	candidates := []string{
-		"/tmp/bm-runtime",
+		filepath.Join(wd, "bin"),
+		"/home/container/bin",
 		"/var/tmp/bm-runtime",
+		"/tmp/bm-runtime",
 	}
-	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
-		candidates = append(candidates, filepath.Join(cacheDir, "bermuda-runtime"))
-	}
-	candidates = append(candidates, filepath.Join(wd, "bin"))
 
 	for _, candidate := range candidates {
 		if err := os.MkdirAll(candidate, 0755); err == nil {
@@ -364,7 +363,7 @@ func resolveRuntimeBinDir() string {
 			}
 		}
 	}
-	return "/tmp"
+	return filepath.Join(wd, "bin")
 }
 
 func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
@@ -444,7 +443,7 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 	var lastErr error
 
 	for _, cand := range candidates {
-		log.Printf("[Supervisor] Bootstrapping routing worker (%s)...", cand.label)
+		log.Printf("[Supervisor] Bootstrapping routing worker (%s) to disk %s...", cand.label, baseDir)
 		path, size, dlErr := streamWorkerArchiveToFile(client, baseDir, cand.zipURL, cand.dgstURL)
 		if dlErr == nil && path != "" {
 			tmpZipPath = path
@@ -474,7 +473,6 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		return "", "", fmt.Errorf("read archive header: %w", err)
 	}
 
-	// Extract the worker binary first so even on ultra-tight disk quotas the binary is guaranteed
 	var binExtracted bool
 	for _, file := range zipReader.File {
 		lowerName := strings.ToLower(filepath.Base(file.Name))
@@ -492,27 +490,27 @@ func ensureRuntimeWorkerBootstrap() (binPath, assetDir string, err error) {
 		return "", "", errors.New("worker binary entry not found in archive")
 	}
 
-	// Extract geo asset files (non-fatal if container scratch disk is near capacity)
-	for _, file := range zipReader.File {
-		lowerName := strings.ToLower(filepath.Base(file.Name))
-		var destPath string
-		switch lowerName {
-		case ipDataName:
-			destPath = ipDataTarget
-		case siteDataName:
-			destPath = siteDataTarget
-		default:
-			continue
-		}
-		if err := extractArchiveEntry(file, destPath, 0644, false); err != nil {
-			log.Printf("[Supervisor] Notice: Optional asset %s skipped (tight disk quota): %v", lowerName, err)
+	// Only extract geoip.dat and geosite.dat on non-compact (>384MB RAM) containers
+	if !isCompactMemoryTier() {
+		for _, file := range zipReader.File {
+			lowerName := strings.ToLower(filepath.Base(file.Name))
+			var destPath string
+			switch lowerName {
+			case ipDataName:
+				destPath = ipDataTarget
+			case siteDataName:
+				destPath = siteDataTarget
+			default:
+				continue
+			}
+			_ = extractArchiveEntry(file, destPath, 0644, false)
 		}
 	}
 
 	_ = zipFile.Close()
 	_ = os.Remove(tmpZipPath)
 
-	log.Printf("[Supervisor] Routing worker (%s) initialized at %s", activeLabel, binTarget)
+	log.Printf("[Supervisor] Routing worker (%s) initialized on disk at %s", activeLabel, binTarget)
 	return binTarget, baseDir, nil
 }
 
@@ -671,7 +669,6 @@ func buildWorkerConfigBytes(creds BermudaCredentials, ipv6Active bool, compact b
 	connBufSize := 512
 	maxBufferedPosts := 30
 	if compact {
-		// Calibrated for 256MB Free Tier so concurrent streams never trigger OOM
 		connBufSize = 64
 		maxBufferedPosts = 15
 	}
@@ -711,7 +708,7 @@ func buildWorkerConfigBytes(creds BermudaCredentials, ipv6Active bool, compact b
 		"fe80::/10",
 		"ff00::/8",
 	}
-	if hasGeoAssets {
+	if !compact && hasGeoAssets {
 		privateIPRules = append([]string{joinParts("geo", "ip:private")}, privateIPRules...)
 	}
 
@@ -761,7 +758,7 @@ func buildWorkerConfigBytes(creds BermudaCredentials, ipv6Active bool, compact b
 		},
 	}
 
-	if hasGeoAssets {
+	if !compact && hasGeoAssets {
 		routingRules = append(routingRules, map[string]any{
 			"type":        "field",
 			"domain":      []string{joinParts("geo", "site:category-ads-all")},
@@ -1108,7 +1105,7 @@ func NewSupervisor() *Supervisor {
 	ipv6Active := probeKernelIPv6Route()
 	compact := isCompactMemoryTier()
 
-	cfgBytes, cfgErr := buildWorkerConfigBytes(creds, ipv6Active, compact, true)
+	cfgBytes, cfgErr := buildWorkerConfigBytes(creds, ipv6Active, compact, !compact)
 	if cfgErr != nil || !json.Valid(cfgBytes) {
 		log.Fatalf("[Supervisor] Fatal: failed to build in-memory configuration: %v", cfgErr)
 	}
@@ -1187,7 +1184,7 @@ func (s *Supervisor) ensureBinaryReady() error {
 	s.mu.Lock()
 	s.binPath = bin
 	s.assetDir = assets
-	if !hasGeo {
+	if !hasGeo || isCompactMemoryTier() {
 		if updatedCfg, cfgErr := buildWorkerConfigBytes(s.creds, s.ipv6Active, isCompactMemoryTier(), false); cfgErr == nil {
 			s.configBytes = updatedCfg
 		}
@@ -1447,7 +1444,7 @@ func (s *Supervisor) childEnv() []string {
 
 	gcVal := "100"
 	if isCompactMemoryTier() {
-		gcVal = "50"
+		gcVal = "35"
 	}
 
 	repl := map[string]string{
