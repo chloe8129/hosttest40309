@@ -109,7 +109,6 @@ func cgroupMemoryLimit() (uint64, bool) {
 		return n, true
 	}
 
-	// Check container environment variables injected by Bot-Hosting / Pterodactyl
 	for _, envKey := range []string{"SERVER_MEMORY", "MEMORY_LIMIT", "BERMUDA_CONTAINER_MEM_MB"} {
 		if raw := strings.TrimSpace(getEnv(envKey, "")); raw != "" {
 			if mb, err := strconv.ParseUint(raw, 10, 64); err == nil && mb >= 64 && mb <= 65536 {
@@ -122,7 +121,6 @@ func cgroupMemoryLimit() (uint64, bool) {
 }
 
 func deriveMemoryBudget() (gwMB, workerMB int, compact bool) {
-	// Default to ultra-safe 256MB Free Tier budget when cgroup is unreadable so Exit 137 is impossible
 	gwMB, workerMB, compact = compactSelfMemMB, compactWorkerMemMB, true
 
 	limit, limited := cgroupMemoryLimit()
@@ -282,8 +280,19 @@ func isBotHostingNodeHost(h string) bool {
 	if _, ok := knownBotHostingNodeIPs[h]; ok {
 		return true
 	}
-	if strings.HasSuffix(h, ".bot-hosting.net") && !strings.HasSuffix(h, ".apps.bot-hosting.net") {
+	if _, ok := knownBotHostingNodeFQDNs[h]; ok {
 		return true
+	}
+	for _, suffix := range []string{".bot-hosting.net", ".bot-hosting.cloud"} {
+		if strings.HasSuffix(h, suffix) &&
+			!strings.HasSuffix(h, ".apps.bot-hosting.net") &&
+			!strings.HasSuffix(h, ".apps.bot-hosting.cloud") &&
+			!strings.HasSuffix(h, ".site.bot-hosting.cloud") {
+			sub := strings.TrimSuffix(h, suffix)
+			if sub != "" && !strings.Contains(sub, ".") {
+				return true
+			}
+		}
 	}
 	if strings.HasSuffix(h, ".your-server.de") || strings.HasSuffix(h, ".hetzner.com") {
 		return true
@@ -325,8 +334,7 @@ func isBotHostingPublicDomain(h string) bool {
 		return false
 	}
 	return (strings.HasSuffix(h, ".apps.bot-hosting.cloud") ||
-		strings.HasSuffix(h, ".site.bot-hosting.cloud") ||
-		strings.HasSuffix(h, ".bot-hosting.cloud")) &&
+		strings.HasSuffix(h, ".site.bot-hosting.cloud")) &&
 		!strings.HasSuffix(h, ".internal") &&
 		!strings.HasSuffix(h, ".local") &&
 		!strings.HasSuffix(h, ".cluster.local") &&
@@ -338,7 +346,7 @@ func isFullBotHostingServiceDomain(h string) bool {
 	if h == "" || isBotHostingCnameAlias(h) {
 		return false
 	}
-	for _, suffix := range []string{".apps.bot-hosting.cloud", ".site.bot-hosting.cloud", ".bot-hosting.cloud"} {
+	for _, suffix := range []string{".apps.bot-hosting.cloud", ".site.bot-hosting.cloud"} {
 		if strings.HasSuffix(h, suffix) {
 			sub := strings.TrimSuffix(h, suffix)
 			return sub != ""
@@ -407,7 +415,7 @@ func resolveInfrastructureDomains() (bhDomain, customDomain, nodeHost string) {
 
 	for _, candidate := range []string{nodeEnv, subEnv, explicitBH} {
 		if isBotHostingNodeHost(candidate) || (candidate != "" && net.ParseIP(candidate) != nil) {
-			nodeHost = candidate
+			nodeHost = resolveNodeHostToIP(candidate)
 			break
 		}
 	}
@@ -576,13 +584,17 @@ func bindDualListeners(listenCfg *net.ListenConfig, primaryPort string, tlsCfg *
 			continue
 		}
 		listeners = append(listeners, newDualProtocolListener(ln, tlsCfg))
-		boundAddrs = append(boundAddrs, ":"+p)
+		boundAddrs = append(listenersAddr(boundAddrs, ":"+p)...)
 	}
 
 	if len(listeners) == 0 {
 		return nil, nil, firstErr
 	}
 	return listeners, boundAddrs, nil
+}
+
+func listenersAddr(existing []string, addr string) []string {
+	return append(existing, addr)
 }
 
 func orchestrateCloudInfrastructure(
@@ -609,7 +621,7 @@ func orchestrateCloudInfrastructure(
 
 	bhDomain := cleanHost(initialBH)
 	customDomain := cleanHost(initialCF)
-	nodeHost := cleanHost(initialNode)
+	nodeHost := resolveNodeHostToIP(initialNode)
 	containerPort := initialPort
 
 	if curBH, curCF, _ := sup.GetInfrastructureDomains(); bhDomain == "" || customDomain == "" {
@@ -622,7 +634,7 @@ func orchestrateCloudInfrastructure(
 	}
 	if curNode, curPort := sup.GetNodeEndpoint(); nodeHost == "" || containerPort <= 0 {
 		if nodeHost == "" && curNode != "" {
-			nodeHost = curNode
+			nodeHost = resolveNodeHostToIP(curNode)
 		}
 		if containerPort <= 0 && curPort > 0 {
 			containerPort = curPort
@@ -635,7 +647,7 @@ func orchestrateCloudInfrastructure(
 	syncDomains := func(newBH, newCF, newNode string, newPort int) {
 		cleanBH := cleanHost(newBH)
 		cleanCF := cleanHost(newCF)
-		cleanNode := cleanHost(newNode)
+		cleanNode := resolveNodeHostToIP(newNode)
 
 		if isBotHostingPublicDomain(cleanBH) {
 			if bhDomain == "" || (!isFullBotHostingServiceDomain(bhDomain) && isFullBotHostingServiceDomain(cleanBH)) {
