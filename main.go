@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
-	"io"
 	"log"
 	"math"
 	"math/big"
@@ -275,8 +274,6 @@ func cleanHost(h string) string {
 	return strings.ToLower(strings.TrimSpace(h))
 }
 
-// isBotHostingNodeHost identifies physical Hetzner node FQDNs (e.g., "fi3.bot-hosting.net",
-// "node-eu-1.bot-hosting.net", "de1.bot-hosting.net") or known node IPv4 addresses.
 func isBotHostingNodeHost(h string) bool {
 	h = cleanHost(h)
 	if h == "" {
@@ -294,8 +291,6 @@ func isBotHostingNodeHost(h string) bool {
 	return false
 }
 
-// isBotHostingCnameAlias identifies shared reverse-proxy CNAME targets
-// (such as "<id>.site.bot-hosting.cloud" when used as a CNAME target or bare node hosts).
 func isBotHostingCnameAlias(h string) bool {
 	h = cleanHost(h)
 	if h == "" {
@@ -324,8 +319,6 @@ func isBotHostingManagedDomain(h string) bool {
 		strings.HasSuffix(h, ".local")
 }
 
-// isBotHostingPublicDomain identifies the deployment's own public HTTPS subdomain
-// (such as "my-bot.apps.bot-hosting.cloud" or "<id>.site.bot-hosting.cloud").
 func isBotHostingPublicDomain(h string) bool {
 	h = cleanHost(h)
 	if h == "" || isBotHostingCnameAlias(h) {
@@ -382,7 +375,6 @@ func normalizeRegion(raw string) string {
 }
 
 func resolveContainerPort() (string, int) {
-	// Bot-Hosting.net injects SERVER_PORT as the primary allocated container port
 	for _, key := range []string{"SERVER_PORT", "PORT", "BERMUDA_LISTEN_PORT", "APP_PORT"} {
 		if raw := strings.TrimSpace(getEnv(key, "")); raw != "" {
 			if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 65535 {
@@ -423,9 +415,6 @@ func resolveInfrastructureDomains() (bhDomain, customDomain, nodeHost string) {
 	return bhDomain, customDomain, nodeHost
 }
 
-// generateEphemeralSelfSignedTLS creates an in-memory ECDSA P-256 TLS certificate
-// so the single SERVER_PORT can terminate Cloudflare "SSL: Full" TLS 1.3 connections
-// without writing any certificate or key files to disk.
 func generateEphemeralSelfSignedTLS() (*tls.Config, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -471,8 +460,6 @@ func generateEphemeralSelfSignedTLS() (*tls.Config, error) {
 	}, nil
 }
 
-// peekedConn wraps a net.Conn with a buffered reader so we can inspect the first byte
-// on SERVER_PORT (0x16 = TLS ClientHello vs Plain HTTP) while preserving TCP socket methods.
 type peekedConn struct {
 	net.Conn
 	r   *bufio.Reader
@@ -542,7 +529,6 @@ func (l *dualProtocolListener) Accept() (net.Conn, error) {
 		tcp:  tcpConn,
 	}
 
-	// 0x16 (22) is the standard TLS Handshake record ContentType byte
 	if peekErr == nil && len(hdr) == 1 && hdr[0] == 0x16 {
 		return tls.Server(pc, l.tlsConfig), nil
 	}
@@ -755,8 +741,6 @@ func orchestrateCloudInfrastructure(
 	var cfDNSProvisioned bool
 
 	if customDomain != "" {
-		// Strategy 1: If we have a direct Hetzner node host + container SERVER_PORT,
-		// Cloudflare can route directly to nodeHost:containerPort with Orange Cloud + SSL Full!
 		if nodeHost != "" && containerPort > 0 {
 			customDomInfo = &BotHostingCustomDomainInfo{
 				Domain:            customDomain,
@@ -767,7 +751,6 @@ func orchestrateCloudInfrastructure(
 				RecordsVerified:   true,
 			}
 		} else if bh != nil && bh.IsConfigured() {
-			// Strategy 2: Register custom domain via Bot-Hosting API
 			info, err := bh.EnsureCustomDomain(ctx, customDomain)
 			if err != nil {
 				log.Printf("[BotHosting] Notice: Custom domain registration (%s): %v", customDomain, err)
@@ -777,7 +760,6 @@ func orchestrateCloudInfrastructure(
 			}
 		}
 
-		// Strategy 3: Fallback CNAME to activated *.apps.bot-hosting.cloud subdomain
 		if customDomInfo == nil && bhDomain != "" {
 			customDomInfo = &BotHostingCustomDomainInfo{
 				Domain:            customDomain,
@@ -952,7 +934,6 @@ func main() {
 	}
 	region := normalizeRegion(rawRegion)
 
-	// NewSupervisor initializes credentials, in-memory config, and subreaper in <1ms
 	sup := NewSupervisor()
 	sup.SetNodeEndpoint(nodeHost, portNum)
 
@@ -1054,7 +1035,6 @@ func main() {
 		},
 	}
 
-	// Bind Dual-Protocol (TLS 1.3 + Plain HTTP) listener on SERVER_PORT immediately
 	listeners, boundAddrs, err := bindDualListeners(&listenCfg, portStr, tlsCfg)
 	if err != nil {
 		log.Fatalf("[Gateway] Fatal: Cannot bind listener on :%s: %v", portStr, err)
@@ -1082,7 +1062,6 @@ func main() {
 		supErrCh <- sup.Run(supCtx)
 	}()
 
-	// Enforce tight gateway memory ceiling and return bootstrap pages to OS after worker starts
 	go func() {
 		select {
 		case <-sup.BootstrapDone():
