@@ -59,6 +59,37 @@ var knownBotHostingNodeFQDNs = map[string]string{
 	"us3":      "38.58.183.178",
 }
 
+func resolveNodeHostToIP(raw string) string {
+	clean := cleanHost(raw)
+	if clean == "" {
+		return ""
+	}
+	if net.ParseIP(clean) != nil {
+		return clean
+	}
+	if ip, ok := knownBotHostingNodeFQDNs[clean]; ok {
+		return ip
+	}
+	for _, suffix := range []string{".bot-hosting.cloud", ".bot-hosting.net"} {
+		if strings.HasSuffix(clean, suffix) &&
+			!strings.HasSuffix(clean, ".apps.bot-hosting.cloud") &&
+			!strings.HasSuffix(clean, ".site.bot-hosting.cloud") {
+			shortName := strings.TrimSuffix(clean, suffix)
+			if ip, ok := knownBotHostingNodeFQDNs[shortName]; ok {
+				return ip
+			}
+		}
+	}
+	if isBotHostingNodeHost(clean) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", clean); err == nil && len(ips) > 0 {
+			return ips[0].String()
+		}
+	}
+	return clean
+}
+
 type bhAPIError struct {
 	StatusCode int
 	Code       string `json:"code,omitempty"`
@@ -137,12 +168,12 @@ func (info *BotHostingCustomDomainInfo) IsCertificateValid() bool {
 }
 
 type BotHostingClient struct {
-	Token         string
-	DeploymentID  string
-	ServiceName   string
-	TargetPort    int
-	apiBase       string
-	client        *http.Client
+	Token        string
+	DeploymentID string
+	ServiceName  string
+	TargetPort   int
+	apiBase      string
+	client       *http.Client
 
 	reqMu   sync.Mutex
 	lastReq time.Time
@@ -217,7 +248,7 @@ func NewBotHostingClient(token string) *BotHostingClient {
 		apiBase:       apiURL,
 		serviceDomain: bhDom,
 		customDomain:  cfDom,
-		nodeHost:      nodeHost,
+		nodeHost:      resolveNodeHostToIP(nodeHost),
 		client: &http.Client{
 			Timeout: 20 * time.Second,
 		},
@@ -337,15 +368,10 @@ func (c *BotHostingClient) SetNodeEndpoint(nodeHost string, port int) {
 	if c == nil {
 		return
 	}
-	clean := cleanHost(nodeHost)
+	clean := resolveNodeHostToIP(nodeHost)
 	c.mu.Lock()
-	if clean != "" {
-		if ip, ok := knownBotHostingNodeFQDNs[clean]; ok {
-			clean = ip
-		}
-		if isBotHostingNodeHost(clean) || net.ParseIP(clean) != nil {
-			c.nodeHost = clean
-		}
+	if clean != "" && (isBotHostingNodeHost(clean) || net.ParseIP(clean) != nil) {
+		c.nodeHost = clean
 	}
 	if port > 0 && port <= 65535 {
 		c.TargetPort = port
@@ -563,14 +589,13 @@ func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 		cand.Port = p
 	}
 
-	// Parse node object: { name: "fi3", fqdn: "fi3.bot-hosting.net", region: "fi-hel1", ip: "65.108.103.151" }
 	if nodeMap, ok := m["node"].(map[string]any); ok {
 		if s, ok := nodeMap["name"].(string); ok {
 			cand.NodeName = strings.ToLower(strings.TrimSpace(s))
 		}
-		for _, k := range []string{"fqdn", "host", "hostname", "ip", "address"} {
+		for _, k := range []string{"ip", "address", "fqdn", "host", "hostname"} {
 			if s, ok := nodeMap[k].(string); ok && strings.TrimSpace(s) != "" {
-				cand.NodeFQDN = cleanHost(s)
+				cand.NodeFQDN = resolveNodeHostToIP(s)
 				break
 			}
 		}
@@ -585,11 +610,7 @@ func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 	}
 
 	if cand.NodeFQDN == "" && cand.NodeName != "" {
-		if ip, ok := knownBotHostingNodeFQDNs[cand.NodeName]; ok {
-			cand.NodeFQDN = ip
-		} else if strings.Contains(cand.NodeName, ".") {
-			cand.NodeFQDN = cleanHost(cand.NodeName)
-		}
+		cand.NodeFQDN = resolveNodeHostToIP(cand.NodeName)
 	}
 	if cand.Region == "" {
 		if cand.NodeFQDN != "" {
@@ -599,7 +620,6 @@ func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 		}
 	}
 
-	// Parse domains object: { subdomain: "mybot.apps.bot-hosting.cloud", custom: "portal.example.com", ... }
 	if domMap, ok := m["domains"].(map[string]any); ok {
 		for _, k := range []string{"subdomain", "default", "freeSubdomain", "appDomain", "url"} {
 			if s, ok := domMap[k].(string); ok && strings.TrimSpace(s) != "" {
@@ -729,7 +749,7 @@ func parseBHCustomDomainMap(m map[string]any, fallbackSubdomain, fallbackNode st
 
 	if info.CNAMETarget == "" {
 		if fallbackNode != "" {
-			info.CNAMETarget = fallbackNode
+			info.CNAMETarget = resolveNodeHostToIP(fallbackNode)
 			info.DirectNodeMode = true
 		} else if fallbackSubdomain != "" {
 			info.CNAMETarget = fallbackSubdomain
@@ -821,7 +841,7 @@ func (c *BotHostingClient) applyCandidateMetadata(cand bhDeploymentCandidate) {
 		c.customDomain = cand.CustomDomain
 	}
 	if cand.NodeFQDN != "" {
-		c.nodeHost = cand.NodeFQDN
+		c.nodeHost = resolveNodeHostToIP(cand.NodeFQDN)
 	}
 	if cand.Region != "" {
 		c.discoveredRegion = cand.Region
@@ -882,17 +902,14 @@ func (c *BotHostingClient) ResolveRuntimeContext(ctx context.Context) error {
 	var matched *bhDeploymentCandidate
 	for i := range candidates {
 		cand := &candidates[i]
-		// 1. Exact SERVER_PORT match (most reliable on Bot-Hosting.net)
 		if targetPort > 0 && targetPort != 8080 && cand.Port == targetPort {
 			matched = cand
 			break
 		}
-		// 2. Service subdomain match
 		if srvDom != "" && cand.ServiceDomain != "" && strings.EqualFold(cand.ServiceDomain, srvDom) {
 			matched = cand
 			break
 		}
-		// 3. Service name or container hostname match
 		if srvName != "" && strings.EqualFold(cand.Name, srvName) {
 			matched = cand
 			break
@@ -1014,7 +1031,6 @@ func (c *BotHostingClient) PersistMasterKey(ctx context.Context, masterKey strin
 
 	cleanMK := strings.TrimSpace(masterKey)
 
-	// Method 1: POST /api/v1/deployments/:id/env (Add or overwrite an environment variable)
 	postPayload := map[string]any{
 		"key":    "BERMUDA_MASTER_KEY",
 		"value":  cleanMK,
@@ -1028,7 +1044,6 @@ func (c *BotHostingClient) PersistMasterKey(ctx context.Context, masterKey strin
 		return true
 	}
 
-	// Method 2: PATCH /api/v1/deployments/:id/env/BERMUDA_MASTER_KEY
 	patchPath := envBasePath + "/BERMUDA_MASTER_KEY"
 	patchPayload := map[string]any{
 		"value":  cleanMK,
@@ -1066,7 +1081,6 @@ func (c *BotHostingClient) EnsureServiceDomain(ctx context.Context) (string, err
 		return c.GetServiceDomain(), nil
 	}
 
-	// Attempt to activate free *.apps.bot-hosting.cloud subdomain if not yet active
 	subPrefix := strings.ToLower(strings.TrimSpace(srvName))
 	subPrefix = strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
@@ -1161,11 +1175,10 @@ func (c *BotHostingClient) EnsureCustomDomain(ctx context.Context, targetDomain 
 	c.mu.RLock()
 	depID := c.DeploymentID
 	srvDom := c.serviceDomain
-	nodeHost := c.nodeHost
+	nodeHost := resolveNodeHostToIP(c.nodeHost)
 	port := c.TargetPort
 	c.mu.RUnlock()
 
-	// If we know the Hetzner node host and SERVER_PORT, Direct-to-Node Origin Rule mode is immediately ready
 	if nodeHost != "" && port > 0 {
 		c.SetCustomDomain(cleanTarget)
 		c.notifyTopology()
@@ -1224,7 +1237,7 @@ func (c *BotHostingClient) FetchCustomDomainStatus(ctx context.Context, customDo
 		c.mu.RLock()
 		depID := c.DeploymentID
 		srvDom := c.serviceDomain
-		nodeHost := c.nodeHost
+		nodeHost := resolveNodeHostToIP(c.nodeHost)
 		port := c.TargetPort
 		c.mu.RUnlock()
 
