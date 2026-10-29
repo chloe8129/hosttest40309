@@ -584,17 +584,13 @@ func bindDualListeners(listenCfg *net.ListenConfig, primaryPort string, tlsCfg *
 			continue
 		}
 		listeners = append(listeners, newDualProtocolListener(ln, tlsCfg))
-		boundAddrs = append(listenersAddr(boundAddrs, ":"+p)...)
+		boundAddrs = append(boundAddrs, ":"+p)
 	}
 
 	if len(listeners) == 0 {
 		return nil, nil, firstErr
 	}
 	return listeners, boundAddrs, nil
-}
-
-func listenersAddr(existing []string, addr string) []string {
-	return append(existing, addr)
 }
 
 func orchestrateCloudInfrastructure(
